@@ -1,0 +1,7 @@
+{
+  "name": "PinViral",
+  "description": "Viral Pinterest Pin Generator with Real-Time Trend Intelligence. Turn any link into a Pinterest sensation.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
+}
