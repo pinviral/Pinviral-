@@ -325,18 +325,32 @@ async function fetchRealTrends(keyword: string) {
 
   // Pinterest OAuth
   app.get("/api/auth/url", (req, res) => {
-    const clientId = process.env.PINTEREST_CLIENT_ID;
-    // Use APP_URL if available, otherwise fallback to request host
-    const appUrl = (process.env.APP_URL || `${req.protocol}://${req.get('host')}`).replace(/\/$/, "");
+    const clientId = process.env.PINTEREST_CLIENT_ID || "SnapChefAi";
+    
+    // CRITICAL FIX: Use the runtime APP_URL environment variable provided by the platform.
+    // This ensures the callback URL matches the actual container URL, not localhost.
+    // If APP_URL is missing (local dev), fallback to request host.
+    let appUrl = process.env.APP_URL;
+    
+    if (!appUrl) {
+      const host = req.get('host');
+      const protocol = req.protocol;
+      appUrl = `${protocol}://${host}`;
+    }
+    
+    // Remove trailing slash if present
+    appUrl = appUrl.replace(/\/$/, "");
+    
     const redirectUri = `${appUrl}/auth/callback`;
     
     console.log("Generating OAuth URL with redirect_uri:", redirectUri);
 
     const params = new URLSearchParams({
-      client_id: clientId || "mock_client_id",
+      client_id: clientId,
       redirect_uri: redirectUri,
       response_type: "code",
       scope: "boards:read,pins:read,pins:write",
+      // state: "optional_state_string" // Good practice to add state for security
     });
 
     const authUrl = `https://www.pinterest.com/oauth/?${params.toString()}`;
