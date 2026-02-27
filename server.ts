@@ -11,6 +11,16 @@ import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import cookieParser from "cookie-parser";
 import googleTrends from "google-trends-api";
+import { YoutubeTranscript } from 'youtube-transcript';
+import { google } from 'googleapis';
+import { createRequire } from 'module';
+const require = createRequire(import.meta.url);
+let instagramGetUrl: any;
+try {
+  instagramGetUrl = require('instagram-url-direct');
+} catch (e) {
+  console.warn("instagram-url-direct not found");
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -75,7 +85,8 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json());
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ limit: '50mb', extended: true }));
   app.use(cookieParser());
 
   // Auth Middleware
@@ -191,6 +202,141 @@ async function fetchRealTrends(keyword: string) {
     };
   } catch (error) {
     console.error("Google Trends API failed:", error);
+    return null;
+  }
+}
+
+// --- Advanced Metadata Extractors ---
+
+async function extractYouTubeData(url: string) {
+  try {
+    const videoIdMatch = url.match(/(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/);
+    const videoId = videoIdMatch ? videoIdMatch[1] : null;
+    if (!videoId) return null;
+
+    console.log(`Processing YouTube Video: ${videoId}`);
+
+    const youtube = google.youtube({
+      version: 'v3',
+      auth: process.env.YOUTUBE_API_KEY
+    });
+
+    // 1. Fetch Transcript
+    let transcriptText = "";
+    try {
+      const transcript = await YoutubeTranscript.fetchTranscript(videoId);
+      transcriptText = transcript.map(t => t.text).join(" ");
+    } catch (e) {
+      console.log("Transcript unavailable:", e);
+    }
+
+    // 2. Fetch Metadata via YouTube API
+    let videoSnippet: any = null;
+    let tags: string[] = [];
+    try {
+      const videoResponse = await youtube.videos.list({
+        part: ['snippet', 'contentDetails', 'statistics'],
+        id: [videoId]
+      });
+      videoSnippet = videoResponse.data.items?.[0]?.snippet;
+      tags = videoSnippet?.tags || [];
+    } catch (e) {
+      console.error("YouTube API failed, falling back to oEmbed", e);
+      const oembedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`;
+      const { data: oembedData } = await axios.get(oembedUrl);
+      videoSnippet = {
+        title: oembedData.title,
+        description: "",
+        thumbnails: { high: { url: oembedData.thumbnail_url } }
+      };
+    }
+
+    // 3. Summarize with Gemini
+    let enhancedDescription = videoSnippet.description || "";
+    
+    if (transcriptText) {
+      try {
+        const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY || "" });
+        const model = "gemini-3-flash-preview";
+        const result = await ai.models.generateContent({
+          model,
+          contents: `Act as a Pinterest content strategist. Summarize this video transcript in 3-4 concise, value-packed sentences suitable for a Pinterest description. Focus on the key tips, "how-to" aspects, and viral hooks. 
+          
+          Transcript: ${transcriptText.substring(0, 10000)}`
+        });
+        enhancedDescription = `SUMMARY: ${result.text}\n\nORIGINAL DESCRIPTION: ${videoSnippet.description}`;
+      } catch (e) {
+        console.error("Summary generation failed", e);
+      }
+    }
+
+    return {
+      title: videoSnippet.title,
+      description: enhancedDescription,
+      image: videoSnippet.thumbnails?.high?.url || videoSnippet.thumbnails?.default?.url,
+      tags: tags
+    };
+  } catch (e) {
+    console.error("YouTube extraction error:", e);
+    return null;
+  }
+}
+
+async function extractInstagramData(url: string) {
+  try {
+    console.log(`Processing Instagram URL: ${url}`);
+    
+    // Strategy 1: OEmbed (Works for public posts)
+    try {
+      const oembedUrl = `https://api.instagram.com/oembed?url=${encodeURIComponent(url)}&omitscript=true`;
+      const { data } = await axios.get(oembedUrl);
+      return {
+        title: data.title || "Instagram Post",
+        description: data.title || "Check out this post on Instagram",
+        image: data.thumbnail_url
+      };
+    } catch (e) {
+       console.log("IG OEmbed failed");
+    }
+
+    // Strategy 2: Scrape with specific headers
+    const response = await axios.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 14_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Mobile/15E148 Safari/604.1',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      }
+    });
+    
+    const $ = cheerio.load(response.data);
+    const title = $("meta[property='og:title']").attr("content") || "";
+    const description = $("meta[property='og:description']").attr("content") || "";
+    const image = $("meta[property='og:image']").attr("content") || "";
+
+    if (title || image) {
+      return { title, description, image };
+    }
+
+    return null;
+  } catch (e) {
+    console.error("Instagram extraction error:", e);
+    return null;
+  }
+}
+
+async function extractTikTokData(url: string) {
+  try {
+    console.log(`Processing TikTok URL: ${url}`);
+    // TikTok OEmbed
+    const oembedUrl = `https://www.tiktok.com/oembed?url=${encodeURIComponent(url)}`;
+    const { data } = await axios.get(oembedUrl);
+    
+    return {
+      title: data.title || "TikTok Video",
+      description: data.title || "Watch this video on TikTok",
+      image: data.thumbnail_url
+    };
+  } catch (e) {
+    console.error("TikTok extraction error:", e);
     return null;
   }
 }
@@ -474,43 +620,63 @@ async function fetchRealTrends(keyword: string) {
     console.log(`Extracting metadata for: ${url}`);
 
     try {
-      // 3. Extraction Strategy 1: Open Graph Tags
-      const response = await axios.get(url, {
-        headers: { 
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.9'
-        },
-        timeout: 10000 // 10 seconds timeout
-      });
+      // 3. Platform-Specific Extractors
+      let metadata: any = null;
 
-      const $ = cheerio.load(response.data);
-      
-      const metadata = {
-        title: $("meta[property='og:title']").attr("content") || 
-               $("meta[name='twitter:title']").attr("content") || 
-               $("title").text() || 
-               "",
-        description: $("meta[property='og:description']").attr("content") || 
-                     $("meta[name='twitter:description']").attr("content") || 
-                     $("meta[name='description']").attr("content") || 
-                     $("p").first().text() || 
-                     "",
-        image: $("meta[property='og:image']").attr("content") || 
-               $("meta[name='twitter:image']").attr("content") || 
-               $("link[rel='image_src']").attr("href") || 
-               "",
-      };
+      if (url.includes('youtube.com') || url.includes('youtu.be')) {
+        metadata = await extractYouTubeData(url);
+      } else if (url.includes('instagram.com')) {
+        metadata = await extractInstagramData(url);
+      } else if (url.includes('tiktok.com')) {
+        metadata = await extractTikTokData(url);
+      }
+
+      // 4. Fallback to Generic Open Graph Extraction
+      if (!metadata) {
+        const response = await axios.get(url, {
+          headers: { 
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9'
+          },
+          timeout: 10000 // 10 seconds timeout
+        });
+  
+        const $ = cheerio.load(response.data);
+        
+        metadata = {
+          title: $("meta[property='og:title']").attr("content") || 
+                 $("meta[name='twitter:title']").attr("content") || 
+                 $("title").text() || 
+                 "",
+          description: $("meta[property='og:description']").attr("content") || 
+                       $("meta[name='twitter:description']").attr("content") || 
+                       $("meta[name='description']").attr("content") || 
+                       $("p").first().text() || 
+                       "",
+          image: $("meta[property='og:image']").attr("content") || 
+                 $("meta[name='twitter:image']").attr("content") || 
+                 $("link[rel='image_src']").attr("href") || 
+                 "",
+        };
+      }
 
       // Clean up whitespace
-      metadata.title = metadata.title.trim();
-      metadata.description = metadata.description.trim().substring(0, 500);
+      if (metadata) {
+        metadata.title = (metadata.title || "").trim();
+        metadata.description = (metadata.description || "").trim().substring(0, 1000); // Increased limit for summaries
+      }
 
-      // 4. Cache the result
-      db.prepare("INSERT OR REPLACE INTO metadata_cache (url, title, description, image) VALUES (?, ?, ?, ?)")
-        .run(url, metadata.title, metadata.description, metadata.image);
+      // 5. Cache the result
+      if (metadata && (metadata.title || metadata.image)) {
+        db.prepare("INSERT OR REPLACE INTO metadata_cache (url, title, description, image) VALUES (?, ?, ?, ?)")
+          .run(url, metadata.title, metadata.description, metadata.image);
+        
+        res.json(metadata);
+      } else {
+        throw new Error("No metadata found");
+      }
 
-      res.json(metadata);
     } catch (error: any) {
       // 5. Better Error Handling & Logging
       console.error(`Metadata extraction failed for ${url}:`, {
@@ -533,6 +699,45 @@ async function fetchRealTrends(keyword: string) {
         details: "Please enter a title and description manually for your pins.",
         can_manual: true 
       });
+    }
+  });
+
+  app.post("/api/chat/refine", async (req, res) => {
+    const { message, history, metadata } = req.body;
+    
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY || "" });
+      const model = "gemini-3-flash-preview";
+      
+      const systemInstruction = `You are a Pinterest Strategy Assistant. Your goal is to help users refine their idea for creating viral Pinterest pins from a provided link.
+      
+      Current Metadata from Link:
+      Title: ${metadata?.title}
+      Description: ${metadata?.description}
+      
+      User's Goal: Help them decide if they want to:
+      1. Make a "New Version" of the existing pin/content.
+      2. Focus on a specific "Idea" or "Sub-topic" from the content.
+      3. Replicate the "Style" or "Aesthetic".
+      
+      Be conversational, helpful, and act like a Pinterest expert who knows what goes viral. 
+      If the user says something like "generate pins like this", acknowledge it and ask if they want to focus on a specific detail.
+      
+      Keep your responses concise and focused on the Pinterest strategy.`;
+
+      const chat = ai.chats.create({
+        model,
+        config: { systemInstruction }
+      });
+
+      // Format history for Gemini
+      // (Simplified for this implementation)
+      
+      const response = await chat.sendMessage({ message });
+      res.json({ text: response.text });
+    } catch (error: any) {
+      console.error("Chat refinement failed:", error);
+      res.status(500).json({ error: "Failed to process chat message" });
     }
   });
 

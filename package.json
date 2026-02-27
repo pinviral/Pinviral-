@@ -25,6 +25,8 @@
     "file-saver": "^2.0.5",
     "google-auth-library": "^10.6.1",
     "google-trends-api": "^4.9.2",
+    "googleapis": "^171.4.0",
+    "instagram-url-direct": "^2.0.7",
     "jsonwebtoken": "^9.0.3",
     "jszip": "^3.10.1",
     "lucide-react": "^0.546.0",
@@ -34,7 +36,8 @@
     "recharts": "^3.7.0",
     "tailwind-merge": "^3.5.0",
     "validator": "^13.15.26",
-    "vite": "^6.2.0"
+    "vite": "^6.2.0",
+    "youtube-transcript": "^1.2.1"
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
