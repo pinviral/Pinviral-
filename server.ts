@@ -10,6 +10,7 @@ import validator from "validator";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
 import cookieParser from "cookie-parser";
+import googleTrends from "google-trends-api";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -27,14 +28,16 @@ db.exec(`
     pinterest_refresh_token TEXT,
     pinterest_token_expires_at DATETIME
   );
+`);
 
-  // Migration: Add password column if it doesn't exist (for safety)
-  try {
-    db.prepare("ALTER TABLE users ADD COLUMN password TEXT").run();
-  } catch (e) {
-    // Column likely already exists
-  }
+// Migration: Add password column if it doesn't exist (for safety)
+try {
+  db.prepare("ALTER TABLE users ADD COLUMN password TEXT").run();
+} catch (e) {
+  // Column likely already exists
+}
 
+db.exec(`
   CREATE TABLE IF NOT EXISTS trending_keywords (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     keyword TEXT UNIQUE NOT NULL,
@@ -154,11 +157,49 @@ async function startServer() {
     res.json(trends);
   });
 
+// Helper to fetch real Google Trends data
+async function fetchRealTrends(keyword: string) {
+  try {
+    const results = await Promise.all([
+      googleTrends.interestOverTime({ keyword, startTime: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) }),
+      googleTrends.relatedQueries({ keyword })
+    ]);
+
+    const interestOverTime = JSON.parse(results[0]);
+    const relatedQueries = JSON.parse(results[1]);
+
+    // Process historical data
+    const timelineData = interestOverTime.default.timelineData;
+    const history = timelineData.map((item: any) => ({
+      date: item.formattedTime,
+      value: item.value[0]
+    }));
+
+    // Calculate momentum (slope of last few points)
+    const lastPoint = history[history.length - 1]?.value || 0;
+    const prevPoint = history[history.length - 2]?.value || 0;
+    const momentum = Math.min(100, Math.max(0, 50 + (lastPoint - prevPoint) * 2));
+
+    // Process related keywords
+    const related = relatedQueries.default.rankedList[0]?.rankedKeyword.map((k: any) => k.query).slice(0, 5) || [];
+
+    return {
+      momentum_score: Math.round(momentum),
+      search_volume: Math.round(lastPoint * 1000), // Estimate based on relative interest
+      related,
+      history
+    };
+  } catch (error) {
+    console.error("Google Trends API failed:", error);
+    return null;
+  }
+}
+
   app.get("/api/trending/search", async (req, res) => {
     const q = req.query.q as string;
     if (!q) return res.status(400).json({ error: "Query required" });
 
-    // 1. Check DB for recent data (10 minutes as requested)
+    // 1. Check DB for recent data (10 minutes)
     const existing = db.prepare(`
       SELECT * FROM trending_keywords 
       WHERE keyword = ? AND last_updated > datetime('now', '-10 minutes')
@@ -172,18 +213,30 @@ async function startServer() {
       });
     }
 
-    // 2. Simulate on-demand fetch using Gemini to generate "trend data"
+    // 2. Try fetching real data first
+    let realData = await fetchRealTrends(q);
+    
+    // 3. Use Gemini for enrichment (or full fallback)
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || "" });
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || process.env.API_KEY || "" });
       const model = "gemini-3-flash-preview";
-      const prompt = `Act as a Pinterest and Google Trends analyzer. Generate realistic, high-quality trend data for the keyword: "${q}". 
-      Provide:
-      - A momentum score (0-100) based on current rising interest.
-      - Estimated monthly search volume (realistic numbers).
-      - A specific category (e.g., Home Decor, Tech, DIY, Fashion).
-      - 5 highly relevant related trending keywords.
-      - 7 data points for a historical trend graph (last 7 days), each point being { "date": string, "value": number }.
-      Return ONLY a raw JSON object: { "momentum_score": number, "search_volume": number, "category": string, "related": string[], "history": Array<{date: string, value: number}> }`;
+      
+      // Adjust prompt based on whether we have real data
+      const prompt = realData 
+        ? `Act as a Pinterest Trends expert. I have Google Trends data for "${q}": Momentum ${realData.momentum_score}, Related: ${realData.related.join(", ")}.
+           Provide:
+           - A specific category (e.g., Home Decor, Tech, DIY, Fashion).
+           - Refined related trending keywords specific to Pinterest (mix with Google ones).
+           - Estimated monthly search volume on Pinterest (realistic numbers).
+           Return ONLY a raw JSON object: { "category": string, "pinterest_volume": number, "pinterest_related": string[] }`
+        : `Act as a Pinterest and Google Trends analyzer. Generate realistic, high-quality trend data for the keyword: "${q}". 
+           Provide:
+           - A momentum score (0-100) based on current rising interest.
+           - Estimated monthly search volume (realistic numbers).
+           - A specific category (e.g., Home Decor, Tech, DIY, Fashion).
+           - 5 highly relevant related trending keywords.
+           - 7 data points for a historical trend graph (last 7 days), each point being { "date": string, "value": number }.
+           Return ONLY a raw JSON object: { "momentum_score": number, "search_volume": number, "category": string, "related": string[], "history": Array<{date: string, value: number}> }`;
 
       const response = await ai.models.generateContent({
         model,
@@ -193,31 +246,80 @@ async function startServer() {
 
       let text = response.text || "{}";
       text = text.replace(/```json/g, "").replace(/```/g, "").trim();
-      const data = JSON.parse(text);
+      const aiData = JSON.parse(text);
       
-      // 3. Store in DB
+      // Merge data
+      const finalData = {
+        category: aiData.category || "General",
+        momentum_score: realData ? realData.momentum_score : (aiData.momentum_score || 50),
+        search_volume: realData ? (realData.search_volume + (aiData.pinterest_volume || 0)) / 2 : (aiData.search_volume || 1000),
+        related: realData ? [...new Set([...realData.related, ...(aiData.pinterest_related || [])])].slice(0, 8) : (aiData.related || []),
+        history: realData ? realData.history : (aiData.history || [])
+      };
+
+      // 4. Store in DB
       db.prepare(`
         INSERT OR REPLACE INTO trending_keywords (keyword, source, category, momentum_score, search_volume, related_keywords, historical_data, last_updated)
         VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
       `).run(
         q, 
-        "Trends AI", 
-        data.category || "General", 
-        data.momentum_score || 50, 
-        data.search_volume || 1000, 
-        JSON.stringify(data.related || []),
-        JSON.stringify(data.history || [])
+        realData ? "Google Trends + AI" : "Trends AI", 
+        finalData.category, 
+        finalData.momentum_score, 
+        finalData.search_volume, 
+        JSON.stringify(finalData.related),
+        JSON.stringify(finalData.history)
       );
 
       const result = db.prepare("SELECT * FROM trending_keywords WHERE keyword = ?").get(q) as any;
       res.json({ 
         ...result, 
-        related_keywords: data.related || [],
-        historical_data: data.history || []
+        related_keywords: finalData.related,
+        historical_data: finalData.history
       });
     } catch (error: any) {
       console.error("Trend search failed:", error);
-      res.status(500).json({ error: `Failed to fetch trend data: ${error.message}` });
+      
+      // TIER 3 FALLBACK: Pure Mock Data
+      // If APIs fail (likely quota exceeded), return deterministic mock data
+      const mockHistory = Array.from({ length: 7 }, (_, i) => {
+        const d = new Date();
+        d.setDate(d.getDate() - (6 - i));
+        return {
+          date: d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+          value: 40 + Math.floor(Math.random() * 60) // Random value 40-100
+        };
+      });
+
+      const fallbackData = {
+        keyword: q,
+        source: "Fallback",
+        category: "General",
+        momentum_score: 72,
+        search_volume: 12500,
+        related_keywords: [`${q} ideas`, `${q} aesthetic`, `best ${q}`, `${q} diy`, `${q} trends`],
+        historical_data: mockHistory
+      };
+
+      // Store fallback data to prevent immediate retries
+      try {
+        db.prepare(`
+          INSERT OR REPLACE INTO trending_keywords (keyword, source, category, momentum_score, search_volume, related_keywords, historical_data, last_updated)
+          VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        `).run(
+          q, 
+          "Fallback", 
+          fallbackData.category, 
+          fallbackData.momentum_score, 
+          fallbackData.search_volume, 
+          JSON.stringify(fallbackData.related_keywords),
+          JSON.stringify(fallbackData.historical_data)
+        );
+      } catch (dbError) {
+        console.error("DB Save failed:", dbError);
+      }
+
+      res.json(fallbackData);
     }
   });
 

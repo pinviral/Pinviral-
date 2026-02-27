@@ -23,6 +23,8 @@
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
     "file-saver": "^2.0.5",
+    "google-auth-library": "^10.6.1",
+    "google-trends-api": "^4.9.2",
     "jsonwebtoken": "^9.0.3",
     "jszip": "^3.10.1",
     "lucide-react": "^0.546.0",

@@ -30,7 +30,7 @@ import {
   Tooltip, 
   ResponsiveContainer 
 } from 'recharts';
-import { generatePinContent, generatePinImage, PinContent } from './services/geminiService';
+import { generatePinContent, generatePinImage, editPinImage, PinContent } from './services/geminiService';
 
 // --- Types ---
 interface Trend {
@@ -94,6 +94,8 @@ export default function App() {
   const [publishingId, setPublishingId] = useState<string | null>(null);
   const [showSuccess, setShowSuccess] = useState<{ show: boolean; url: string }>({ show: false, url: '' });
   const [editingPin, setEditingPin] = useState<GeneratedPin | null>(null);
+  const [imageEditPrompt, setImageEditPrompt] = useState('');
+  const [isEditingImage, setIsEditingImage] = useState(false);
   const [user, setUser] = useState<any>(null);
   const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
   const [authEmail, setAuthEmail] = useState('');
@@ -377,6 +379,25 @@ export default function App() {
   const handleUpdatePin = (updatedPin: GeneratedPin) => {
     setGeneratedPins(prev => prev.map(p => p.id === updatedPin.id ? updatedPin : p));
     setEditingPin(null);
+    setImageEditPrompt('');
+  };
+
+  const handleEditImage = async () => {
+    if (!editingPin || !editingPin.imageUrl || !imageEditPrompt) return;
+    setIsEditingImage(true);
+    try {
+      const newImageUrl = await editPinImage(editingPin.imageUrl, imageEditPrompt);
+      if (newImageUrl) {
+        setEditingPin({ ...editingPin, imageUrl: newImageUrl });
+        setImageEditPrompt('');
+      } else {
+        alert("Image editing failed. Please try a different prompt.");
+      }
+    } catch (e) {
+      alert("An error occurred while editing the image.");
+    } finally {
+      setIsEditingImage(false);
+    }
   };
 
   const handleSaveToHistory = async (pin: GeneratedPin) => {
@@ -1093,7 +1114,42 @@ export default function App() {
                 </button>
               </div>
               
-              <div className="space-y-4">
+              <div className="space-y-4 max-h-[60vh] overflow-y-auto pr-2">
+                {editingPin.imageUrl && (
+                  <div className="relative group">
+                    <img src={editingPin.imageUrl} alt="Preview" className="w-full aspect-[9/16] object-cover rounded-2xl shadow-inner" />
+                    {isEditingImage && (
+                      <div className="absolute inset-0 bg-black/40 backdrop-blur-sm rounded-2xl flex items-center justify-center">
+                        <div className="animate-spin rounded-full h-8 w-8 border-4 border-white border-t-transparent" />
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className="bg-ios-bg p-4 rounded-2xl space-y-3">
+                  <label className="text-[10px] font-bold text-ios-gray uppercase flex items-center gap-1">
+                    <Sparkles size={12} className="text-ios-blue" />
+                    AI Image Editor
+                  </label>
+                  <div className="flex gap-2">
+                    <input 
+                      type="text"
+                      value={imageEditPrompt}
+                      onChange={(e) => setImageEditPrompt(e.target.value)}
+                      placeholder="e.g. 'Add a retro filter'"
+                      className="ios-input flex-1 text-sm"
+                    />
+                    <button 
+                      onClick={handleEditImage}
+                      disabled={isEditingImage || !imageEditPrompt}
+                      className="bg-ios-blue text-white p-2 rounded-xl disabled:opacity-50"
+                    >
+                      <ArrowRight size={20} />
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-ios-gray">Describe changes like "make it brighter" or "add a vintage look".</p>
+                </div>
+
                 <div>
                   <label className="text-xs font-bold text-ios-gray uppercase">Title</label>
                   <input 
